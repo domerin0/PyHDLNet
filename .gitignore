@@ -8,7 +8,7 @@ __pycache__/
 *.gv
 # C extensions
 *.so
-
+scratch/*
 # Distribution / packaging
 .Python
 build/
