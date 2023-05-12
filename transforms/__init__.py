@@ -1,8 +1,9 @@
-from typing import List
+from typing import Any, List
 import random
 from abc import ABC, abstractmethod
 from dataloaders import Dataset, TransformedDataset
 import math
+from utility import quantize
 
 
 class NeuralTransform(ABC):
@@ -14,6 +15,9 @@ class NeuralTransform(ABC):
 class TransformsPipeline:
     def __init__(self, transforms: List[NeuralTransform]):
         self.transforms = transforms
+
+    def __getitem__(self, index: int) -> Any:
+        return self.transforms[index]
 
     def __call__(self, data: Dataset):
         for transform in self.transforms:
@@ -78,33 +82,40 @@ class DataSplitterTransform(NeuralTransform):
 
 
 class QuantizeTransform(NeuralTransform):
-    def __init__(self, bits: int, signed: bool = False):
+    def __init__(self, bits: int, signed: bool = True,
+                 symmetric=True, scale_factors=[],
+                 zero_points=None):
         if not isinstance(bits, int):
             raise ValueError("Bits must be an integer")
         self.bits = bits
+        self.symmetric = symmetric
+        self.zero_points = zero_points
+        self.scale_factors = scale_factors
+        self.signed = signed
         if signed:
             self.max_int = 2 ** (bits - 1) - 1
-            self.min_int = -2 ** bits
+            self.min_int = -2 ** (bits - 1) if not symmetric else - \
+                (2 ** (bits - 1) - 1)
         else:
             self.max_int = 2 ** bits - 1
             self.min_int = 0
 
-    def normalize(self, max_vals: List[float], min_vals: List[float], data: List[List[float]]):
-        def map_range(range1: tuple, range2: tuple, val):
-            slope = (range2[1] - range2[0]) / (range1[1] - range1[0])
-            mapped = min(range2[1], max(range2[0], round(
-                range2[0] + slope * (val - range1[0]))))
-            return mapped
+    def normalize(self, data: List[List[float]]):
         for row in data:
             for i in range(len(row[0])):
-                row[0][i] = map_range((min_vals[i], max_vals[i]),
-                                      (self.min_int, self.max_int),
-                                      row[0][i])
+                row[0][i] = quantize(
+                    row[0][i],
+                    self.scale_factors[i],
+                    self.zero_points[i],
+                    self.max_int,
+                    self.min_int,
+                )
         return data
 
     def __call__(self, data: Dataset) -> Dataset:
         max_vals = []
         min_vals = []
+
         for key in list(data.get_names()):
             for row in data[key]:
                 for i in range(len(row[0])):
@@ -118,8 +129,26 @@ class QuantizeTransform(NeuralTransform):
                     if row[0][i] < min_vals[i]:
                         min_vals[i] = row[0][i]
 
+        if self.zero_points is None:
+            self.zero_points = [0] * len(max_vals)
+
+        for i in range(len(max_vals)):
+            if self.symmetric:
+                self.scale_factors.append(
+                    self.max_int /
+                    max(
+                        abs(max_vals[i]),
+                        abs(min_vals[i])
+                    )
+                )
+            else:
+                self.scale_factors.append(
+                    (self.max_int - self.min_int) /
+                    (max_vals[i] - min_vals[i])
+                )
+
         for key in list(data.get_names()):
-            data[key] = self.normalize(max_vals, min_vals, data[key])
+            data[key] = self.normalize(data[key])
 
         return data
 
