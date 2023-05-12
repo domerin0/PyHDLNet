@@ -6,6 +6,9 @@ __pycache__/
 *.csv
 *.v
 *.gv
+torch_model.py
+*.pt
+8.pkl
 # C extensions
 *.so
 scratch/*
