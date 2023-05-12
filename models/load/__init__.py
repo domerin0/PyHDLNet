@@ -10,7 +10,7 @@ def load_torch(model_path, model_class=None):
     return model
 
 
-def quantize_tensor(tensor, bits=8, signed=False, symmetric=True):
+def quantize_torch_tensor(tensor, bits=8, signed=False, symmetric=True):
     '''
         Quantization that supports signed and unsigned integers 
         as well as symmetric or asymetric ranges.

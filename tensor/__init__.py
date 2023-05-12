@@ -24,6 +24,7 @@ class HDLTensor:
         else:
             self.max_int = 2 ** bits - 1
             self.min_int = 0
+
         if value is None:
             rand = uniform_int(self.max_int, self.min_int, dims[0], dims[1])
             self.value = Matrix(dims[0], dims[1], bits, value=rand)
@@ -76,6 +77,23 @@ class HDLTensor:
             for j in range(self.columns):
                 self.value[i, j] = self.value[i, j][:bits]
         self.value.bits = bits
+
+    def divide_nbit_unsigned(bits, num, divisor):
+        # Initialize quotient as 0
+        quotient = 0
+        # Initialize remainder as 0
+        remainder = 0
+
+        # Iterate through each bit
+        for i in range(bits):
+            # Left-shift remainder and add next bit of num
+            remainder = (remainder << 1) | ((num >> (bits - 1 - i)) & 1)
+            if remainder >= divisor:
+                remainder -= divisor
+                # Set corresponding quotient bit if division is possible
+                quotient |= (1 << (bits - 1 - i))
+
+        return quotient
 
     def __floordiv__(self, b: HDLTensor) -> HDLTensor:
         '''
