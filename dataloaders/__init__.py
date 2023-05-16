@@ -1,6 +1,5 @@
 import csv
 from abc import ABC
-from tensor import PyTensor
 from typing import List, Any
 
 
