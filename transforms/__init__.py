@@ -3,7 +3,7 @@ import random
 from abc import ABC, abstractmethod
 from dataloaders import Dataset, TransformedDataset
 import math
-from utility import quantize
+from tensor import Tensor
 
 
 class NeuralTransform(ABC):
@@ -82,74 +82,35 @@ class DataSplitterTransform(NeuralTransform):
 
 
 class QuantizeTransform(NeuralTransform):
-    def __init__(self, bits: int, signed: bool = True,
-                 symmetric=True, scale_factors=[],
-                 zero_points=None):
+    def __init__(self,
+                 bits: int,
+                 signed: bool = True,
+                 symmetric=True):
         if not isinstance(bits, int):
             raise ValueError("Bits must be an integer")
         self.bits = bits
         self.symmetric = symmetric
-        self.zero_points = zero_points
-        self.scale_factors = scale_factors
         self.signed = signed
         if signed:
-            self.max_int = 2 ** (bits - 1) - 1
-            self.min_int = -2 ** (bits - 1) if not symmetric else - \
-                (2 ** (bits - 1) - 1)
+            self.max_int = (2 ** (bits - 1)) - 1
+            self.min_int = -(2 ** (bits - 1)) if not symmetric else \
+                -((2 ** (bits - 1)) - 1)
         else:
-            self.max_int = 2 ** bits - 1
+            self.max_int = (2 ** bits) - 1
             self.min_int = 0
 
-    def normalize(self, data: List[List[float]]):
-        for row in data:
-            for i in range(len(row[0])):
-                row[0][i] = quantize(
-                    row[0][i],
-                    self.scale_factors[i],
-                    self.zero_points[i],
-                    self.max_int,
-                    self.min_int,
-                )
-        return data
-
     def __call__(self, data: Dataset) -> Dataset:
-        max_vals = []
-        min_vals = []
-
         for key in list(data.get_names()):
-            for row in data[key]:
-                for i in range(len(row[0])):
-                    if len(min_vals) <= i:
-                        min_vals.append(row[0][i])
-                    if len(max_vals) <= i:
-                        max_vals.append(row[0][i])
-
-                    if row[0][i] > max_vals[i]:
-                        max_vals[i] = row[0][i]
-                    if row[0][i] < min_vals[i]:
-                        min_vals[i] = row[0][i]
-
-        if self.zero_points is None:
-            self.zero_points = [0] * len(max_vals)
-
-        for i in range(len(max_vals)):
-            if self.symmetric:
-                self.scale_factors.append(
-                    self.max_int /
-                    max(
-                        abs(max_vals[i]),
-                        abs(min_vals[i])
-                    )
-                )
-            else:
-                self.scale_factors.append(
-                    (self.max_int - self.min_int) /
-                    (max_vals[i] - min_vals[i])
-                )
-
-        for key in list(data.get_names()):
-            data[key] = self.normalize(data[key])
-
+            matrix = [r[0] for r in data[key]]
+            tensor = Tensor(
+                len(data[key]), len(data[key][0]),
+                value=matrix
+            )
+            matrix = tensor.quantize(
+                bits=self.bits, signed=self.signed
+            ).tolist()
+            for i in range(len(matrix)):
+                data[key][i] = (matrix[i], data[key][i][1])
         return data
 
 
