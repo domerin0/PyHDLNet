@@ -1,4 +1,4 @@
-from tensor import HDLTensor, PyTensor
+from tensor import HDLTensor
 from typing import Any, List
 from abc import ABC, abstractmethod
 import pyrtl.rtllib.matrix as matrix
@@ -12,10 +12,14 @@ class NeuralModule(ABC):
         self.sim = False
 
     @abstractmethod
-    def forward(self, input: HDLTensor) -> HDLTensor:
+    def forward(self, x: HDLTensor) -> HDLTensor:
         pass
 
-    def __call__(self, input: HDLTensor) -> HDLTensor:
+    @abstractmethod
+    def backward(self, y_pred: HDLTensor, y: HDLTensor) -> HDLTensor:
+        pass
+
+    def __call__(self, x: HDLTensor) -> HDLTensor:
         return self.forward(input)
 
     @abstractmethod
@@ -54,6 +58,17 @@ class ReLU(NeuralModule):
                 )
         return inputs
 
+    def backward(self, d_out: HDLTensor, x_in: HDLTensor) -> HDLTensor:
+        for i in range(d_out.rows):
+            for j in range(d_out.columns):
+                d_out.ternary(
+                    i, j,
+                    lambda _: x_in[i, j] < self.zero_point,
+                    self.zero_point,
+                    d_out[i, j]
+                )
+        return d_out
+
     def __repr__(self) -> str:
         return "ReLU()"
 
@@ -75,7 +90,14 @@ class SoftMax(NeuralModule):
         if self.mode == 'eval':
             return inputs.argmax(axis=1)
         elif self.mode == 'train':
-            raise NotImplementedError("SoftMax not implemented for training")
+            # second order taylor approximation
+            for i in range(inputs.rows):
+                for j in range(inputs.columns):
+                    right = (inputs[i, j] * inputs[i, j])[:-(inputs.bits-1)]
+                    inputs[i, j] = (1 + inputs[i, j] + right)
+
+    def backward(self, y_pred: HDLTensor, y: HDLTensor) -> HDLTensor:
+        raise NotImplementedError("SoftMax backward not implemented")
 
     def __repr__(self) -> str:
         return "SoftMax()"
@@ -90,49 +112,36 @@ class SoftMax(NeuralModule):
         super().train()
 
 
-class TruncateLSB(NeuralModule):
-    def __init__(self, bits: int) -> None:
-        super().__init__()
-        self.bits = bits
-
-    def forward(self, other: HDLTensor) -> HDLTensor:
-        other.truncate_lsb(bits=self.bits)
-        return other
-
-    def __repr__(self) -> str:
-        return "TruncateLSB(bits={0})".format(self.bits)
-
-    def __str__(self) -> str:
-        return "TruncateLSB(bits={0})".format(self.bits)
-
-    def eval(self) -> None:
-        super().eval()
-
-    def train(self) -> None:
-        return super().train()
-
-
 class Linear(NeuralModule):
     def __init__(self,
                  in_d: int,
                  out_d: int,
-                 precision_bits: int = 4,
+                 bits: int = 8,
+                 truncate_bits: int = 0,
                  signed=False,
                  weights: List[List[float]] = None,
                  bias: List[float] = None) -> None:
         super().__init__()
+
+        if truncate_bits >= bits**2:
+            raise ValueError(
+                "Truncate bits {0} cannot be greater than precision bits {1}"
+                .format(truncate_bits, bits)
+            )
+
         if weights is None:
             self.weights = HDLTensor(
                 out_d,
                 in_d,
-                bits=precision_bits,
+                bits=bits,
                 signed=signed
             )
         else:
             self.weights = HDLTensor(
                 out_d,
                 in_d,
-                bits=precision_bits, value=weights,
+                bits=bits,
+                value=weights,
                 signed=signed
             )
 
@@ -140,25 +149,46 @@ class Linear(NeuralModule):
             self.bias = HDLTensor(
                 1,
                 out_d,
-                bits=precision_bits,
+                value=[[0 for _ in range(out_d)]],
+                bits=bits,
                 signed=signed
             )
         else:
             self.bias = HDLTensor(
                 1,
                 out_d,
-                bits=precision_bits,
+                bits=bits,
                 value=bias,
                 signed=signed
             )
 
+        self.bits = bits
+        self.truncate_bits = truncate_bits
         self.in_d = in_d
         self.out_d = out_d
 
     def forward(self, other: HDLTensor) -> HDLTensor:
         other @= self.weights.transpose()
-        other += self.bias
+        for i in range(other.rows):
+            other.value[i, :] += self.bias.value
+        if self.truncate_bits > 0:
+            other.truncate_lsb(msb=self.truncate_bits,
+                               acc_bits=2 * self.bits)
         return other
+
+    def backward(self, dout: HDLTensor, x_in: HDLTensor) -> HDLTensor:
+        if self.backprop_ones is None:
+            self.backprop_ones = HDLTensor(
+                x_in.rows,
+                dout.rows,
+                bits=self.bits,
+                value=[[1 for i in range(dout.rows)] for _ in range(x_in.rows)]
+            )
+        db += self.backprop_ones @ dout
+
+        dw += x_in.transpose() @ dout
+        dx = x_in.transpose() @ self.weights
+        return dx
 
     def __repr__(self) -> str:
         return "Linear({0}, {1})".format(self.in_d, self.out_d)
@@ -188,8 +218,17 @@ class Sequential(NeuralModule):
             vec = layer.forward(vec)
         return vec
 
+    def backward(self, y_pred: HDLTensor, y: HDLTensor) -> HDLTensor:
+        vec = input
+        for layer in reversed(self.layers):
+            vec = layer.backward(vec)
+        return vec
+
     def __call__(self, *args: Any, **kwds: Any) -> Any:
-        return self.forward(*args, **kwds)
+        y = self.forward(*args, **kwds)
+        if self.mode == 'train':
+            self.backward(y, *args, **kwds)
+        return y
 
     def __repr__(self) -> str:
         return "(\n{0}\n)".format(",\n".join([repr(l) for l in self.layers]))
