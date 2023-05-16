@@ -31,14 +31,8 @@ Building infrastructure for training.
 - LSTM/GRU
 
 
-
-
-
-
-
-
 ### Test
 
 ```bash
-python -m unittest discover -s test
+python -m unittest discover -s tests/
 ```
