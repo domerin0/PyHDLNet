@@ -1,4 +1,4 @@
-from tensor import HDLTensor
+from tensor import HDLTensor, HDLScalar
 from typing import Any, List
 from abc import ABC, abstractmethod
 import pyrtl.rtllib.matrix as matrix
@@ -83,18 +83,49 @@ class ReLU(NeuralModule):
 
 
 class SoftMax(NeuralModule):
-    def __init__(self) -> None:
+    def __init__(self, output_dim=None, batch_size=1, signed=False, bits=8) -> None:
         super().__init__()
+        self.one = HDLScalar(1)
+        self.output_dim = output_dim
+        self.batch_size = batch_size
+        self.max_int = HDLScalar(2**bits if not signed else 2**(bits-1))
+        self.acc = None
+        if output_dim is not None:
+            self.acc = HDLTensor(batch_size, output_dim, bits=bits+20)
 
     def forward(self, inputs: HDLTensor) -> HDLTensor:
         if self.mode == 'eval':
             return inputs.argmax(axis=1)
         elif self.mode == 'train':
+            if self.acc is None:
+                raise ValueError(
+                    "Must provide output_dim to SoftMax for training")
+
             # second order taylor approximation
             for i in range(inputs.rows):
                 for j in range(inputs.columns):
-                    right = (inputs[i, j] * inputs[i, j])[:-(inputs.bits-1)]
-                    inputs[i, j] = (1 + inputs[i, j] + right)
+                    self.acc[i, j] = inputs[i, j] * inputs[i, j]
+                    self.acc.shift_elem_right(1, i, j)
+                    self.acc[i, j] = self.acc[i, j] + 1 + inputs[i, j]
+
+            # sum up rows
+            sums = self.acc.sum(axis=1)
+
+            # scale up by max_int, divide by sum
+            for i in range(self.acc.rows):
+                for j in range(self.acc.columns):
+                    self.acc[i, j] = self.acc[i, j] * self.max_int.value
+                    self.acc[i, j] = self.acc.divide_scalar(
+                        divisor=sums[0, i],
+                        row=i,
+                        col=j
+                    )
+
+            # return estimated softmax
+            return self.acc
+
+        raise ValueError(
+            "Mode {0} not supported, use train() or eval()".format(self.mode))
 
     def backward(self, y_pred: HDLTensor, y: HDLTensor) -> HDLTensor:
         raise NotImplementedError("SoftMax backward not implemented")

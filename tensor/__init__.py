@@ -57,10 +57,6 @@ class HDLTensor:
             max_bits=2*bits
         )
         self.one = Const(1, bitwidth=bits)
-        # self.acc3 = Matrix(1, 1, bits,
-        #                        value=[[0]], max_bits=bits)
-        # self.acc2 = Matrix(1, 1, bits,
-        #                         value=[[0]], max_bits=bits)
         self.shift_left = shift_left_logical
         self.shift_right = shift_right_logical
         if self.signed:
@@ -201,6 +197,9 @@ class HDLTensor:
         # return quotient
         return temp_acc[0, 0]
 
+    def shift_elem_right(self, shift_amount: int, row: int, col: int):
+        return self.shift_right(self.value[row, col], shift_amount)
+
     def log2(self, row: int, col: int):
         '''
         Calculates the log2 of the tensor at the specified row and column.
@@ -232,6 +231,7 @@ class HDLTensor:
         '''
         Performs element-wise division of two tensors.
         Also does scalar division if divisor is 1x1 tensor.
+        Also does scalar division by row if input is 1xN tensor.
 
         Args:
             dividend (HDLTensor): The dividend.
@@ -243,6 +243,22 @@ class HDLTensor:
                 raise ValueError(
                     "Cannot divide HDLTensor of different dimensions"
                 )
+        if divisor.columns == 1 and divisor.rows == self.rows and self.rows > 1:
+            for i in range(self.rows):
+                acc.value[i, 0] = self.divide_scalar(
+                    divisor=divisor.value[i, 0],
+                    row=i,
+                    col=0,
+                )
+                return acc
+        elif divisor.rows == 1 and divisor.columns == self.rows and self.rows > 1:
+            for i in range(self.rows):
+                acc.value[0, i] = self.divide_scalar(
+                    divisor=divisor.value[0, i],
+                    row=i,
+                    col=0,
+                )
+                return acc
         for dividend_row in range(self.rows):
             for dividend_col in range(self.columns):
                 dividend_val = self.value[dividend_row, dividend_col]
@@ -318,7 +334,7 @@ class HDLTensor:
 
     def __mul__(self, other: HDLTensor):
         if isinstance(other, float) or isinstance(other, int):
-            mat = self.value * other.value
+            mat = self.value * other
         mat = self.value * other.value
         return HDLTensor(mat.rows, mat.columns, bits=mat.bits, value=mat)
 

@@ -30,7 +30,7 @@ class TestNeuralNetworkLayers(unittest.TestCase):
             [[101, 52, 236, 53], [201, 145, 239, 146]]
         ))
 
-    def test_softmax_forward(self):
+    def test_softmax_eval_forward(self):
         softmax = SoftMax()
         softmax.eval()
         x = HDLTensor(2, 3, value=[[100, 50, 231], [200, 9, 143]])
@@ -40,6 +40,18 @@ class TestNeuralNetworkLayers(unittest.TestCase):
         self.assertTrue(matrix_list_equal(
             output.value,
             [[2, 0]]
+        ))
+
+    def test_softmax_train_forward(self):
+        softmax = SoftMax(output_dim=3, batch_size=2)
+        softmax.train()
+        x = HDLTensor(2, 3, value=[[100, 50, 231], [200, 9, 143]])
+
+        output = softmax.forward(x)
+        self.assertEqual(isinstance(output, HDLTensor), True)
+        self.assertTrue(matrix_list_equal(
+            output.value,
+            [[39, 9, 207], [169, 0, 86]]
         ))
 
     def test_relu_forward(self):
