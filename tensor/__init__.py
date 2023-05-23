@@ -13,8 +13,14 @@ from typing import Any
 
 class HDLScalar:
     def __init__(self, value, bits=None, signed=False):
-        self.value = Const(value, bitwidth=bits, signed=signed)
-        self.bits = bits
+        if isinstance(value, pyrtl.WireVector):
+            self.value = value
+        else:
+            self.value = Const(value, bitwidth=bits, signed=signed)
+
+    @property
+    def bits(self):
+        return self.value.bitwidth
 
 
 class HDLTensor:
@@ -24,7 +30,7 @@ class HDLTensor:
         self.signed = signed
         self.shape = dims
         self.original_bits = bits
-
+        max_bits = bits**2
         if signed:
             self.max_int = 2 ** (bits - 1) - 1
             self.min_int = -(2 ** (bits - 1))
@@ -35,10 +41,14 @@ class HDLTensor:
         if value is None:
             rand = uniform_int(self.max_int, self.min_int, dims[0], dims[1])
             self.value = Matrix(dims[0], dims[1], bits,
-                                value=rand, max_bits=2*bits)
+                                value=rand, max_bits=max_bits)
         elif isinstance(value, pyrtl.Input) or isinstance(value, list):
-            self.value = Matrix(dims[0], dims[1], bits,
-                                value=value, max_bits=2*bits)
+            self.value = Matrix(
+                dims[0], dims[1],
+                bits=bits,
+                value=value,
+                max_bits=max_bits
+            )
         elif isinstance(value, str) and value == 'input':
             self.value = Matrix(
                 dims[0],
@@ -47,14 +57,14 @@ class HDLTensor:
                 value=pyrtl.Input(
                     bitwidth=dims[0]*dims[1]*bits,
                     name='net_input'),
-                max_bits=2*bits
+                max_bits=max_bits
             )
         else:
             self.value = value
         self.acc = Matrix(
             1, 3,
             bits, value=[[0, 0, 0]],
-            max_bits=2*bits
+            max_bits=max_bits
         )
         self.one = Const(1, bitwidth=bits)
         self.shift_left = shift_left_logical
@@ -98,7 +108,7 @@ class HDLTensor:
             HDLTensor: A tensor containing the sum along the specified axis.
 
         '''
-        mat = matrix.sum(self.value, axis=axis)
+        mat = matrix.sum(self.value, axis=axis, bits=self.bits+1)
         return HDLTensor(mat.rows, mat.columns, bits=mat.bits, value=mat)
 
     def max(self, axis: int):
@@ -112,21 +122,48 @@ class HDLTensor:
             HDLTensor: A tensor containing the maximum value along the specified axis.
         '''
         val = matrix.max(self.value, axis=axis)
-        return HDLTensor(val.rows, val.columns, bits=val.bits, value=val)
+        if isinstance(val, Matrix):
+            return HDLTensor(val.rows, val.columns, bits=val.bits, value=val)
+        return HDLScalar(val)
 
-    def truncate_lsb(self, msb: int, acc_bits: int):
+    def truncate_lsb(self, msb: int):
         '''
         Truncates the least significant bits of the tensor.
         Keeps only msb bits from the tensor.
 
         Args:
             msb (int): The number of bits to keep from the most significant bit.
-            acc_bits (int): The number of useful accumulated bits.
         '''
-        for i in range(self.rows):
-            for j in range(self.columns):
-                self.value[i, j] = self.value[i, j][msb-1:acc_bits]
-            # self.value.bits = bits
+        max_int = 2**msb if self.signed else 2**msb - 1
+        for b in range(self.bits):
+            known_max = self.max(axis=None)
+            for i in range(self.rows):
+                for j in range(self.columns):
+                    self.ternary(
+                        i, j,
+                        lambda _: known_max.value > max_int-1,
+                        self.shift_right(self[i, j], 1),
+                        self[i, j]
+                    )
+
+    def copy(self, bits: int = None):
+        '''
+        Creates a deep copy of the tensor.
+        Args:
+            bits: Number of bits in the copied tensor (optional).
+        Returns:
+            HDLTensor: A tensor containing the copy.
+        '''
+        if bits is not None or not isinstance(bits, int):
+            raise ValueError("bits must be an integer or None")
+        if bits is not None and bits < 1:
+            raise ValueError("bits must be greater than 0")
+
+        return HDLTensor(
+            self.rows, self.columns,
+            bits=bits if bits is not None else self.bits,
+            value=self.value.copy()
+        )
 
     def add_inplace(self, other: WireVector) -> HDLTensor:
         '''
@@ -235,9 +272,21 @@ class HDLTensor:
 
         Args:
             dividend (HDLTensor): The dividend.
-            divisor (HDLTensor): The divisor.
+            divisor (HDLTensor | HDLScalar): The divisor.
             acc (HDLTensor): The accumulator.
         '''
+        # Handle scalar division
+        if isinstance(divisor, HDLScalar):
+            for dividend_row in range(self.rows):
+                for dividend_col in range(self.columns):
+                    dividend_val = self.value[dividend_row, dividend_col]
+
+                    acc.value[dividend_row, dividend_col] = self.divide_nbit_unsigned(
+                        dividend=dividend_val,
+                        divisor=divisor.value,
+                        bits=acc.bits,
+                    )
+            return acc
         if divisor.rows != self.rows or divisor.columns != self.columns:
             if divisor.rows != 1 or divisor.columns != 1:
                 raise ValueError(
@@ -281,7 +330,9 @@ class HDLTensor:
         Perform the element-wise division op.
         b must match the dimensions of self or be a scalar (1x1 tensor). 
         '''
-        raise NotImplementedError("Use divide() instead")
+        if not isinstance(b, HDLTensor) and not isinstance(b, HDLScalar):
+            raise ValueError("divisor must be an HDLTensor or HDLScalar")
+        return self.divide(b, acc=self)
 
     def __truediv__(self, b: HDLTensor) -> HDLTensor:
         '''
@@ -297,6 +348,12 @@ class HDLTensor:
         self.value[row, col] = select(
             cond_fn(self.value[row, col]), true, false
         )
+
+    def zero(self):
+        '''
+        Sets all values in the tensor to zero.
+        '''
+        self.value *= 0
 
     @property
     def bits(self):
@@ -376,6 +433,10 @@ class HDLTensor:
     def __iadd__(self, other):
         self = self.__add__(other)
         return self
+
+    def dot(self, other):
+        mat = matrix.dot(self.value, other.value)
+        return HDLTensor(mat.rows, mat.columns, bits=mat.bits, value=mat)
 
     def __sub__(self, other):
         mat = self.value - other.value

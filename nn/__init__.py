@@ -1,15 +1,14 @@
 from tensor import HDLTensor, HDLScalar
 from typing import Any, List
 from abc import ABC, abstractmethod
-import pyrtl.rtllib.matrix as matrix
 
 
 class NeuralModule(ABC):
-
     @abstractmethod
     def __init__(self) -> None:
         self.mode = 'train'
         self.sim = False
+        self.requires_grad = False
 
     @abstractmethod
     def forward(self, x: HDLTensor) -> HDLTensor:
@@ -42,12 +41,25 @@ class NeuralModule(ABC):
         self.sim = True
 
 
-class ReLU(NeuralModule):
-    def __init__(self, zero_point=0) -> None:
+class NeuralContainer(NeuralModule):
+    @abstractmethod
+    def __init__(self) -> None:
         super().__init__()
-        self.zero_point = zero_point
+        self.modules = []
+        self.input_dic = {}
+
+    # @abstractmethod
+    # def
+
+
+class ReLU(NeuralModule):
+    def __init__(self) -> None:
+        super().__init__()
+        self.zero_point = None
 
     def forward(self, inputs: HDLTensor) -> HDLTensor:
+        if self.zero_point is None:
+            self.zero_point = 0 if inputs.signed else 2**inputs.bits // 2
         for i in range(inputs.rows):
             for j in range(inputs.columns):
                 inputs.ternary(
@@ -73,7 +85,7 @@ class ReLU(NeuralModule):
         return "ReLU()"
 
     def __str__(self) -> str:
-        return "ReLU()"
+        return "relu"
 
     def eval(self) -> None:
         super().eval()
@@ -83,23 +95,22 @@ class ReLU(NeuralModule):
 
 
 class SoftMax(NeuralModule):
-    def __init__(self, output_dim=None, batch_size=1, signed=False, bits=8) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.one = HDLScalar(1)
-        self.output_dim = output_dim
-        self.batch_size = batch_size
-        self.max_int = HDLScalar(2**bits if not signed else 2**(bits-1))
+        self.max_int = None
         self.acc = None
-        if output_dim is not None:
-            self.acc = HDLTensor(batch_size, output_dim, bits=bits+20)
 
     def forward(self, inputs: HDLTensor) -> HDLTensor:
         if self.mode == 'eval':
             return inputs.argmax(axis=1)
         elif self.mode == 'train':
             if self.acc is None:
-                raise ValueError(
-                    "Must provide output_dim to SoftMax for training")
+                self.max_int = HDLScalar(
+                    2**inputs.bits if not inputs.signed else 2**(inputs.bits-1))
+                self.acc = HDLTensor(
+                    inputs.rows, inputs.columns, bits=inputs.bits+20
+                )
 
             # second order taylor approximation
             for i in range(inputs.rows):
@@ -127,14 +138,14 @@ class SoftMax(NeuralModule):
         raise ValueError(
             "Mode {0} not supported, use train() or eval()".format(self.mode))
 
-    def backward(self, y_pred: HDLTensor, y: HDLTensor) -> HDLTensor:
+    def backward(self, d_out: HDLTensor, x_in: HDLTensor) -> HDLTensor:
         raise NotImplementedError("SoftMax backward not implemented")
 
     def __repr__(self) -> str:
         return "SoftMax()"
 
     def __str__(self) -> str:
-        return "SoftMax()"
+        return "softmax"
 
     def eval(self) -> None:
         super().eval()
@@ -198,6 +209,10 @@ class Linear(NeuralModule):
         self.in_d = in_d
         self.out_d = out_d
 
+        self.grad_b = None
+        self.grad_w = None
+        self.requires_grad = False
+
     def forward(self, other: HDLTensor) -> HDLTensor:
         other @= self.weights.transpose()
         for i in range(other.rows):
@@ -207,52 +222,105 @@ class Linear(NeuralModule):
                                acc_bits=2 * self.bits)
         return other
 
-    def backward(self, dout: HDLTensor, x_in: HDLTensor) -> HDLTensor:
-        if self.backprop_ones is None:
-            self.backprop_ones = HDLTensor(
-                x_in.rows,
-                dout.rows,
-                bits=self.bits,
-                value=[[1 for i in range(dout.rows)] for _ in range(x_in.rows)]
+    def backward(self, d_out: HDLTensor, x_in: HDLTensor) -> HDLTensor:
+        """
+        Calculates dw, db for the linear layer
+        Args:
+            d_out :  Gradient of the cost with respect to the linear output. 
+                     or the accumulated gradients from the prev layers. 
+                     This is used for the chain rule to compute the gradients.
+            x_in :   Original input to the layer. 
+        Returns:
+            dx : Gradient of cost wrt to the activation of the previous layer or the input of the 
+                 current layer.
+        """
+        if self.grad_w is None:
+            self.m = HDLScalar(x_in.columns)
+        # gradient of loss wrt to the weights
+        self.grad_w = x_in.transpose() @ d_out
+        self.grad_w = self.grad_w // self.m
+        # gradient of the loss wrt to the bias
+        self.grad_b = d_out.sum(axis=0)
+        self.grad_b = self.grad_b // self.m
+        # gradient of the loss wrt to the input of the linear layer
+        # this is used to continue the chain rule
+        dx = d_out @ self.weights
+        if self.truncate_bits > 0:
+            self.grad_w.truncate_lsb(
+                msb=self.truncate_bits,
             )
-        db += self.backprop_ones @ dout
+            self.grad_b.truncate_lsb(
+                msb=self.truncate_bits,
+            )
+            dx.truncate_lsb(
+                msb=self.truncate_bits,
+            )
 
-        dw += x_in.transpose() @ dout
-        dx = x_in.transpose() @ self.weights
         return dx
+
+    def update(self, lr_top: int, lr_bottom: int) -> None:
+        self.weights -= lr_top * self.grad_w // lr_bottom
+        self.bias -= lr_top * self.grad_b // lr_bottom
 
     def __repr__(self) -> str:
         return "Linear({0}, {1})".format(self.in_d, self.out_d)
 
     def __str__(self) -> str:
-        return "Linear({0}, {1})".format(self.in_d, self.out_d)
+        return "linear_{0}_{1}".format(self.in_d, self.out_d)
 
     def eval(self) -> None:
         return super().eval()
 
+    def zero_grad(self) -> None:
+        self.grad_w.zero()
+        self.grad_b.zero()
+
     def train(self) -> None:
+        self.requires_grad = True
         return super().train()
 
 
 class Sequential(NeuralModule):
-    def __init__(self, layers: List[NeuralModule]) -> None:
+    def __init__(self, *layers) -> None:
         super().__init__()
-        self.layers = layers
+        self.layers_count = {}
+        self.layers = [{
+            "name": self.get_layer_name(l),
+            "value": l
+        }for l in list(layers)]
+
         self.setup_done = None
 
+    def get_layer_name(self, layer: NeuralModule) -> str:
+        if layer not in self.layers_count:
+            self.layers_count[str(layer)] = 0
+        self.layers_count[layer] += 1
+        return "{0}_{1}".format(str(layer), self.layers_count[layer])
+
     def add(self, layer: NeuralModule) -> None:
-        self.layers.append(layer)
+        l = {
+            "name": self.get_layer_name(layer),
+            "value": layer
+        }
+        if self.mode == 'train':
+            l.train()
+        else:
+            l.eval()
+
+        self.layers.append(l)
 
     def forward(self, input: HDLTensor) -> HDLTensor:
         vec = input
         for layer in self.layers:
-            vec = layer.forward(vec)
+            if self.mode == 'train':
+                layer["input"] = vec.copy()
+            vec = layer["value"].forward(vec)
         return vec
 
-    def backward(self, y_pred: HDLTensor, y: HDLTensor) -> HDLTensor:
-        vec = input
+    def backward(self, y_pred: HDLTensor, y_true: HDLTensor) -> HDLTensor:
+        vec = y_pred
         for layer in reversed(self.layers):
-            vec = layer.backward(vec)
+            grad_out = layer["value"].backward(layer["input"], vec)
         return vec
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
@@ -265,7 +333,7 @@ class Sequential(NeuralModule):
         return "(\n{0}\n)".format(",\n".join([repr(l) for l in self.layers]))
 
     def __str__(self) -> str:
-        return "(\n\t{0}\n)".format(",\n\t".join([str(l) for l in self.layers]))
+        return "sequential"
 
     def eval(self) -> None:
         super().eval()
